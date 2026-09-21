@@ -11,6 +11,8 @@ from typing import Any
 
 import boto3
 
+from path_safety import safe_output_directory, validate_test_run_id
+
 
 def load_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Drive9 AgentCore regression tests.")
@@ -22,7 +24,8 @@ def load_args() -> argparse.Namespace:
 
 args = load_args()
 deployment = json.loads(Path(args.deployment).read_text(encoding="utf-8"))
-output_dir = Path(args.output) / deployment["test_run_id"]
+test_run_id = validate_test_run_id(deployment.get("test_run_id"))
+output_dir = safe_output_directory(args.output, test_run_id)
 output_dir.mkdir(parents=True, exist_ok=True)
 jsonl_path = output_dir / "results.jsonl"
 report_path = output_dir / "report.md"
@@ -135,7 +138,7 @@ c_visibility = invoke(
     sessions["agent-c"],
     {
         "action": "visibility_test",
-        "path": f":/agentcore-tests/{deployment['test_run_id']}/shared",
+        "path": f":/agentcore-tests/{test_run_id}/shared",
         "expect_visible": False,
     },
     "ISOLATION-C-001",
@@ -198,7 +201,7 @@ else:
 
 lines = [
     "# Drive9 on AWS Bedrock AgentCore Runtime Instances 测试报告", "",
-    f"- Test Run ID: `{deployment['test_run_id']}`", f"- Architecture: `{deployment['architecture']}`", f"- Instance Type: `{deployment['instance_type']}`", f"- Overall Decision: **{decision}**", "",
+    f"- Test Run ID: `{test_run_id}`", f"- Architecture: `{deployment['architecture']}`", f"- Instance Type: `{deployment['instance_type']}`", f"- Overall Decision: **{decision}**", "",
     "## 结果汇总", "", "| Status | Count |", "|---|---:|",
 ]
 if args.skip_mount:
