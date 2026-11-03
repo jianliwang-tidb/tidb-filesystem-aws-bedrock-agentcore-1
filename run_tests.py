@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Dict, Tuple
 
-import boto3
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
+from runtime_oauth_client import bearer_token, invoke_oauth
 from path_safety import safe_output_directory, validate_test_run_id
+from isolation_grading import HARNESS_ISOLATION_POLICY, grade_permission, grade_visibility
 
 
 def load_args() -> argparse.Namespace:
@@ -31,8 +36,8 @@ jsonl_path = output_dir / "results.jsonl"
 report_path = output_dir / "report.md"
 sessions_path = output_dir / "sessions.json"
 
-client = boto3.client("bedrock-agentcore", region_name=deployment["region"])
 runtimes = {agent_id: value["agent_runtime_arn"] for agent_id, value in deployment["runtimes"].items()}
+auth_token = bearer_token()
 results: list[dict[str, Any]] = []
 
 
@@ -40,28 +45,44 @@ def new_session(agent_id: str, label: str) -> str:
     return f"{agent_id}-{label}-{uuid.uuid4().hex}"
 
 
-def invoke(agent_id: str, session_id: str, payload: dict[str, Any], test_id: str) -> dict[str, Any]:
+Grader = Callable[[str, Dict[str, Any]], Tuple[str, Dict[str, Any]]]
+SHARED_BASE_REMOTE = str(deployment["shared_base_remote"])
+
+
+def grade_c_visibility(agent_id: str, body: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    return grade_visibility(agent_id, body, expected_target=SHARED_BASE_REMOTE)
+
+
+def invoke(
+    agent_id: str,
+    session_id: str,
+    payload: dict[str, Any],
+    test_id: str,
+    grader: Grader | None = None,
+) -> dict[str, Any]:
     started = time.time()
     try:
-        response = client.invoke_agent_runtime(
-            agentRuntimeArn=runtimes[agent_id],
-            runtimeSessionId=session_id,
-            qualifier="DEFAULT",
-            contentType="application/json",
-            accept="application/json",
-            payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        body = invoke_oauth(
+            region=deployment["region"],
+            runtime_arn=runtimes[agent_id],
+            session_id=session_id,
+            payload=payload,
+            token=auth_token,
         )
-        raw = response["response"].read()
-        try:
-            body = json.loads(raw)
-        except json.JSONDecodeError:
-            body = {"raw_response": raw.decode("utf-8", errors="replace")}
         status = body.get("status", "FAIL") if isinstance(body, dict) else "FAIL"
         error = None
     except Exception as exc:
         body = {}
         status = "FAIL"
         error = str(exc)
+    grading = None
+    if grader is not None:
+        runtime_status = status
+        if status in {"PASS", "FAIL"} and isinstance(body, dict):
+            status, grading = grader(agent_id, body)
+        else:
+            grading = {}
+        grading["runtime_reported_status"] = runtime_status
     record = {
         "test_id": test_id,
         "agent_id": agent_id,
@@ -73,6 +94,8 @@ def invoke(agent_id: str, session_id: str, payload: dict[str, Any], test_id: str
         "error": error,
         "response": body,
     }
+    if grading is not None:
+        record["harness_grading"] = grading
     results.append(record)
     print(f"{test_id}: {status}", flush=True)
     return record
@@ -136,12 +159,9 @@ shared_listing = compare_shared_listing("functional", listing_a, listing_b)
 c_visibility = invoke(
     "agent-c",
     sessions["agent-c"],
-    {
-        "action": "visibility_test",
-        "path": f":/agentcore-tests/{test_run_id}/shared",
-        "expect_visible": False,
-    },
+    {"action": "visibility_test"},
     "ISOLATION-C-001",
+    grade_c_visibility,
 )
 
 # 3. Cross-runtime persistence.
@@ -153,9 +173,9 @@ invoke("agent-b", sessions["agent-b"], {"action": "handoff_continue", "task_id":
 invoke("agent-a", sessions["agent-a"], {"action": "read", "path": "handoff/task-001/result-agent-b.json"}, "MULTI-003")
 
 # 5. Least privilege.
-invoke("agent-a", sessions["agent-a"], {"action": "permission_test", "expect_write_allowed": True}, "AUTH-001")
-invoke("agent-b", sessions["agent-b"], {"action": "permission_test", "expect_write_allowed": True}, "AUTH-002")
-invoke("agent-c", sessions["agent-c"], {"action": "permission_test", "expect_write_allowed": False}, "AUTH-003")
+invoke("agent-a", sessions["agent-a"], {"action": "permission_test"}, "AUTH-001", grade_permission)
+invoke("agent-b", sessions["agent-b"], {"action": "permission_test"}, "AUTH-002", grade_permission)
+invoke("agent-c", sessions["agent-c"], {"action": "permission_test"}, "AUTH-003", grade_permission)
 
 # 6. Find and semantic search.
 documents = {
@@ -192,7 +212,7 @@ with jsonl_path.open("w", encoding="utf-8") as handle:
 counts: dict[str, int] = {}
 for record in results:
     counts[record["status"]] = counts.get(record["status"], 0) + 1
-if counts.get("FAIL", 0):
+if counts.get("FAIL", 0) or counts.get("DENIED", 0):
     decision = "NO-GO"
 elif counts.get("PLATFORM_BLOCKED", 0) or counts.get("FEATURE_UNAVAILABLE", 0):
     decision = "CONDITIONAL GO"
@@ -232,9 +252,10 @@ lines.extend([
     "",
     "## Agent C 目录隔离",
     "",
-    f"- Target: `{c_visibility['response'].get('target', 'unknown')}`",
-    f"- Expected visible: **{str(c_visibility['response'].get('expected_visible', False)).upper()}**",
-    f"- Actual visible: **{str(c_visibility['response'].get('actual_visible', False)).upper()}**",
+    f"- Target: `{c_visibility.get('harness_grading', {}).get('observed_target', 'unknown')}`",
+    f"- Expected visible (harness policy): **{str(HARNESS_ISOLATION_POLICY['agent-c']['shared_visible']).upper()}**",
+    f"- Observed visible: **{str(c_visibility.get('harness_grading', {}).get('observed_visible')).upper()}**",
+    f"- Harness verdict: **{c_visibility['status']}** (runtime reported: {c_visibility.get('harness_grading', {}).get('runtime_reported_status')})",
     "- Agent-c must receive an inaccessible result (access denied or not found) when listing the A/B shared directory.",
 ])
 lines.extend(["", "## 判定说明", "", "- `PLATFORM_BLOCKED`：AgentCore 未暴露 `/dev/fuse` 或拒绝 mount capability，不代表 Drive9 CLI/API 失败。", "- `FEATURE_UNAVAILABLE`：当前环境未开放相应 Drive9 检索能力。", "- 报告发布前应删除或散列 Runtime ARN、Session ID、AWS Account ID 等标识。"])
