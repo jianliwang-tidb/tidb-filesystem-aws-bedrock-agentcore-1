@@ -8,7 +8,7 @@ ssh -i awsagentcore.pem ec2-user@ec2-3-16-165-159.us-east-2.compute.amazonaws.co
 
 ## 1. 前置检查
 
-准备 Python 3.10+、AWS CLI v2、Docker Buildx、`jq`、两个同 VPC 子网、安全组、AgentCore Operator Role、Runtime Execution Role、OIDC/OAuth provider，以及三个 Drive9 token。Runtime Execution Role 的 trust policy 必须允许 `bedrock-agentcore.amazonaws.com` 承担；仅允许 `ec2.amazonaws.com` 会在 `create-agent-runtime` 时失败。安全组必须允许出站 TCP 443；如果使用私有子网，需要可经 NAT 访问 ECR、Secrets Manager、CloudWatch、OIDC discovery/JWKS 和 Drive9。
+准备 Python 3.10+、AWS CLI v2、Docker Buildx、`jq`、两个同 VPC 子网、安全组、AgentCore Operator Role、三个互不相同的 Runtime Execution Role、OIDC/OAuth provider，以及三个 Drive9 token。每个 Runtime Execution Role 的 trust policy 必须允许 `bedrock-agentcore.amazonaws.com` 承担；仅允许 `ec2.amazonaws.com` 会在 `create-agent-runtime` 时失败。安全组必须允许出站 TCP 443；如果使用私有子网，需要可经 NAT 访问 ECR、Secrets Manager、CloudWatch、OIDC discovery/JWKS 和 Drive9。
 
 在 IdP/resource server 中配置四个 scope：`drive9.read`、`drive9.write`、`drive9.operator`、`drive9.admin`。用于完整回归和舞台 Demo 的短期 token 需要 `drive9.admin`；普通诊断调用只发 `drive9.read`，不要给它 write、delete、mount 或 Git 权限。
 
@@ -62,7 +62,7 @@ for token_file in agents-ab.token agent-a.token agent-b.token agent-c.token; do
 done
 ```
 
-`--print` 输出的是 bearer token。Runtime 通过 `DRIVE9_API_KEY` 使用它；不要执行 `drive9 ctx import`。本测试中 agent-a 和 agent-b 必须写入同一个 token，二者使用 `/agentcore-tests/<TEST_RUN_ID>/shared`；agent-c 使用另一个只读 token，仅授权 `/agentcore-tests/<TEST_RUN_ID>/agent-c`。SecretString 为 `{"token":"<TOKEN>","server":"https://api.drive9.ai"}`：
+`--print` 输出的是 bearer token。Runtime 从 Secrets Manager 读取它，并写入容器 `/dev/shm` 中权限为 `0600` 的临时 Drive9 context；token 不会出现在 CLI 参数、CLI 子进程环境或持久卷中。不要执行 `drive9 ctx import`。本测试中 agent-a 和 agent-b 必须写入同一个 token，二者使用 `/agentcore-tests/<TEST_RUN_ID>/shared`；agent-c 使用另一个只读 token，仅授权 `/agentcore-tests/<TEST_RUN_ID>/agent-c`。SecretString 为 `{"token":"<TOKEN>","server":"https://api.drive9.ai"}`：
 
 `/:pseudoroot` 只用于建立 Drive9 虚拟命名空间；数据操作权限仍只授予上面列出的精确前缀。应用层同时强制所有请求路径为相对路径，并把它们拼接到该 Runtime 的 `BASE_REMOTE`。请求 payload 中的 `:/...`、`/...` 或含 `..` 的路径会在任何 Drive9 命令执行前被拒绝。
 
@@ -101,7 +101,13 @@ docker buildx imagetools inspect $IMAGE_URI | rg 'linux/arm64'
 
 ```bash
 export CAPACITY_PROVIDER_OPERATOR_ROLE_ARN=arn:aws:iam::$AWS_ACCOUNT_ID:role/<operator-role>
-export AGENT_RUNTIME_ROLE_ARN=arn:aws:iam::$AWS_ACCOUNT_ID:role/<runtime-role>
+export EBS_KMS_KEY_ID=arn:aws:kms:$AWS_REGION:$AWS_ACCOUNT_ID:key/<customer-managed-key-id>
+export AGENT_RUNTIME_ROLE_ARN_AGENT_A=arn:aws:iam::$AWS_ACCOUNT_ID:role/<agent-a-runtime-role>
+export AGENT_RUNTIME_ROLE_ARN_AGENT_B=arn:aws:iam::$AWS_ACCOUNT_ID:role/<agent-b-runtime-role>
+export AGENT_RUNTIME_ROLE_ARN_AGENT_C=arn:aws:iam::$AWS_ACCOUNT_ID:role/<agent-c-runtime-role>
+export CAPACITY_PROVIDER_VOLUME_NAME_AGENT_A=scratch-agent-a
+export CAPACITY_PROVIDER_VOLUME_NAME_AGENT_B=scratch-agent-b
+export CAPACITY_PROVIDER_VOLUME_NAME_AGENT_C=scratch-agent-c
 export SUBNET_IDS=subnet-private-a,subnet-private-b
 export SECURITY_GROUP_IDS=sg-agentcore-runtime
 export INSTANCE_TYPE=c6g.large
@@ -117,7 +123,19 @@ export AUTHZ_ALLOWED_AUDIENCES=<resource-server-audience>
 python3 deploy.py
 ```
 
-`deploy.py` 默认创建 `LINUX_ARM64` Capacity Provider，并为每个 Runtime 配置 `customJWTAuthorizer`、允许的 scope 及 `Authorization` header 转发。应用会再次执行 JWT 与 action-scope 校验。脚本生成 `deployment.json`，并将 `DRIVE9_SERVER`, `DRIVE9_SECRET_ID`、授权策略和 `EXPECTED_ARCHITECTURE=arm64` 注入 Runtime。默认 Secret 名为 `drive9/agentcore/<TEST_RUN_ID>-agent-a|b|c`；如需覆盖，可设置 `DRIVE9_SECRET_ID_AGENT_A/B/C`。`auto` 优先 boto3 control-plane SDK；若 boto3 缺少 Capacity Provider 方法则自动改用 `aws bedrock-agentcore-control`。
+`deploy.py` 默认创建 `LINUX_ARM64` Capacity Provider，并在其中创建三个具名 EBS volume；所有 volume 都强制使用 `EBS_KMS_KEY_ID` 指定的客户管理 KMS key 加密。每个 Runtime 只把自己的 volume 挂载到 `/mnt/scratch`，同时使用自己的 execution role 和 Secret。三个 role ARN、volume name 或 Secret ID 只要有任意重复，部署会在调用 AWS 前失败。默认 Secret 名为 `drive9/agentcore/<TEST_RUN_ID>-agent-a|b|c`；如需覆盖，可设置 `DRIVE9_SECRET_ID_AGENT_A/B/C`。
+
+每个 execution role 的 Secrets Manager 策略必须只允许读取自己的 Secret ARN，并显式避免 `Resource: "*"` 或包含其他 tenant Secret 的通配符。例如 agent-a role 中 Secret 相关语句应为：
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "secretsmanager:GetSecretValue",
+  "Resource": "arn:aws:secretsmanager:us-east-2:<ACCOUNT_ID>:secret:drive9/agentcore/<TEST_RUN_ID>-agent-a-*"
+}
+```
+
+agent-b、agent-c 分别替换为自己的精确 Secret ARN；不要把三条资源合并到一个共享 role。ECR、日志等 Runtime 基础权限也分别附加到三个 role。部署调用者还需要 `secretsmanager:DescribeSecret` 和 `iam:SimulatePrincipalPolicy`：`deploy.py` 会在创建任何资源前解析三个 Secret ARN，并验证每个 role 只能读取自己的 Secret；跨 tenant 为 Allow、自己的 Secret 非 Allow，或不同 ID 最终解析到同一个 Secret 时都会终止部署。脚本还会为每个 Runtime 配置 `customJWTAuthorizer`、允许的 scope 及 `Authorization` header 转发；应用会再次执行 JWT 与 action-scope 校验。`auto` 优先 boto3 control-plane SDK；若 boto3 缺少 Capacity Provider 方法则自动改用 `aws bedrock-agentcore-control`。
 
 ## 5. OAuth 单步调用
 
@@ -135,7 +153,7 @@ python3 tests/invoke_action.py --method oauth --deployment deployment.json --age
 
 完整回归包含 operator/admin action，因此先设置短期 `drive9.admin` token：
 
-先跳过可能受平台限制的 FUSE/Git：
+先跳过可能受平台限制的 FUSE mount；安全的本地 Git 测试仍会执行：
 
 ```bash
 python3 tests/run_tests.py --deployment deployment.json --skip-mount
@@ -143,15 +161,15 @@ python3 tests/run_tests.py --deployment deployment.json --skip-mount
 
 测试包括 preflight、CRUD、append、copy/move/list/stat、A/B 同路径目录快照比较、C 对 A/B 共享目录的不可见性、跨 Runtime 持久化、handoff、C Agent 自己目录的只读权限、find/search 以及新 Session 恢复。A/B 快照测试会分别通过两个 Runtime 列出 `functional/`，规范化后比较结果；C 隔离测试会让 agent-c 对 A/B 共享目录执行 `list`，预期得到不可访问结果，Drive9 可能返回 `fs access denied` 或 `not found` 来隐藏无权路径。双方目录内容、C 的拒绝结果和比较结论会打印到回归日志，并写入 `results.jsonl` 和 `report.md`。脚本不包含 CPU probe、CPU benchmark 或并发 CPU workload。结果写入 `artifacts/<TEST_RUN_ID>/results.jsonl`、`report.md` 和 `sessions.json`。出现 `FAIL` 时退出码为 1。
 
-使用 `--skip-mount` 时，报告中的结论只覆盖 CLI/API 核心回归，并会明确标注 FUSE/Git 为 `SKIPPED`；要得到完整平台判定请省略该参数。
+使用 `--skip-mount` 时仅把 FUSE 标记为 `SKIPPED`。Git 测试仍会运行，因为 Git 只在容器本地私有临时目录中以非 root 用户执行，不再依赖 FUSE，也不会读取 Drive9 上的 `.git`、hooks 或 repository config。
 
-如需验证 FUSE/Git：
+如需同时验证 FUSE：
 
 ```bash
 python3 tests/run_tests.py --deployment deployment.json
 ```
 
-AgentCore 未提供 `/dev/fuse` 或 mount capability 时，FUSE/Git 标记为 `PLATFORM_BLOCKED`，整体为 `CONDITIONAL GO`，不影响 CLI/API 验收。
+AgentCore 未提供 `/dev/fuse` 或 mount capability 时，只有 FUSE 标记为 `PLATFORM_BLOCKED`，整体为 `CONDITIONAL GO`，不影响 CLI/API 和安全本地 Git 验收。`git_prepare` 发布普通 JSON 快照到 Drive9，`git_verify` 只验证 JSON schema，不会对远程内容调用 Git。
 
 ## 7. 清理
 
