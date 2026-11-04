@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -47,6 +50,38 @@ def caller(*scopes: str):
         caller_id="9f86d081884c7d65",
         scopes=frozenset(scopes),
     )
+
+
+class SecureRuntimeDefaultsTests(unittest.TestCase):
+    def test_drive9_child_environment_is_allowlisted_and_has_no_credentials(self) -> None:
+        os.environ["DRIVE9_API_KEY"] = "must-not-leak"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "must-not-leak"
+        try:
+            with patch.object(app, "_drive9_memory_home", return_value=Path("/dev/shm/test")):
+                environment = app._drive9_env()
+        finally:
+            del os.environ["DRIVE9_API_KEY"]
+            del os.environ["AWS_SECRET_ACCESS_KEY"]
+        self.assertNotIn("DRIVE9_API_KEY", environment)
+        self.assertFalse(any(name.startswith("AWS_") for name in environment))
+        self.assertEqual(environment["DRIVE9_CLI_LOG_ENABLED"], "false")
+
+    def test_secret_is_written_only_to_a_mode_0600_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            memory_home = Path(temporary) / "home"
+            memory_home.mkdir(mode=0o700)
+            with (
+                patch.object(app, "_drive9_memory_home", return_value=memory_home),
+                patch.object(app, "_load_secret_token", return_value="unit-test-secret"),
+            ):
+                app._install_drive9_memory_context()
+            context_file = memory_home / ".drive9" / "config"
+            self.assertEqual(context_file.stat().st_mode & 0o777, 0o600)
+            document = json.loads(context_file.read_text(encoding="utf-8"))
+            self.assertEqual(document["contexts"][app.AGENT_ID]["api_key"], "unit-test-secret")
+
+    def test_response_capture_has_a_hard_upper_bound(self) -> None:
+        self.assertLessEqual(app.MAX_RESPONSE_BYTES, 1048576)
 
 
 class AuthorizationMatrixTests(unittest.TestCase):
