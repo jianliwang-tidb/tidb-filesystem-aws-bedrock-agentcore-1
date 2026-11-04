@@ -63,6 +63,12 @@ class RemotePathConfinementTests(unittest.TestCase):
             f"{app.BASE_REMOTE}/functional/result.txt",
         )
 
+    def test_non_string_and_unsafe_character_paths_are_rejected(self) -> None:
+        for path in (123, ["other-agent", "file"], "bad\\path", "line\nbreak"):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    app._remote(path)
+
     def test_every_caller_path_sink_rejects_absolute_remote_paths_before_execution(self) -> None:
         outside = ":/agentcore-tests/another-run/shared/target.txt"
         original = (app._ensure_context, app._drive9_env, app._run)
